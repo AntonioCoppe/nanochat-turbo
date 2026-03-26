@@ -128,24 +128,45 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     return y.transpose(1, 2)  # back to (B, T, H, D)
 
 
-def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=None,
-                            causal=False, window_size=(-1, -1)):
+def flash_attn_with_kvcache(q, k_cache=None, v_cache=None, k=None, v=None, cache_seqlens=None,
+                            causal=False, window_size=(-1, -1), kv_cache=None, layer_idx=None):
     """
     Flash Attention with KV cache for inference.
 
-    FA3 updates k_cache/v_cache in-place. Our SDPA fallback does the same.
+    FA3 updates dense k_cache/v_cache in-place. The TurboQuant path stores
+    compressed KV and reconstructs the active slice on demand before SDPA.
 
     Args:
         q: Queries, shape (B, T_new, H, D)
-        k_cache, v_cache: Pre-allocated cache tensors, shape (B, T_max, H_kv, D)
+        k_cache, v_cache: Dense pre-allocated cache tensors, shape (B, T_max, H_kv, D)
         k, v: New keys/values to insert, shape (B, T_new, H_kv, D)
         cache_seqlens: Current position in cache, shape (B,) int32
         causal: Whether to use causal masking
         window_size: (left, right) sliding window. -1 means unlimited.
+        kv_cache: Optional TurboQuant cache object
+        layer_idx: Required when kv_cache is TurboQuant-backed
 
     Returns:
         Output tensor of shape (B, T_new, H, D)
     """
+    # TurboQuant paper (Zandieh et al., 2025): correctness-first path that stores
+    # packed KV and reconstructs the active cache slice before running SDPA.
+    if kv_cache is not None and getattr(kv_cache, "is_turbo", False):
+        assert cache_seqlens is not None, "cache_seqlens is required for TurboQuant KV cache"
+        assert layer_idx is not None, "layer_idx is required for TurboQuant KV cache"
+        B, T_new, H, D = q.shape
+        pos = cache_seqlens[0].item()
+        if k is not None and v is not None:
+            kv_cache.quantize_and_store(layer_idx, k, v, pos)
+        end_pos = pos + T_new
+        k_full, v_full = kv_cache.get_dequantized_slice(layer_idx, 0, end_pos, dtype=q.dtype)
+        q_sdpa = q.transpose(1, 2)
+        k_sdpa = k_full.transpose(1, 2)
+        v_sdpa = v_full.transpose(1, 2)
+        enable_gqa = q_sdpa.size(1) != k_sdpa.size(1)
+        y_sdpa = _sdpa_attention(q_sdpa, k_sdpa, v_sdpa, window_size, enable_gqa)
+        return y_sdpa.transpose(1, 2)
+
     if USE_FA3:
         return _fa3.flash_attn_with_kvcache(
             q, k_cache, v_cache, k=k, v=v, cache_seqlens=cache_seqlens,

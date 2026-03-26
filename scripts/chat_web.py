@@ -44,7 +44,7 @@ from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
 from pydantic import BaseModel
 from typing import List, Optional, AsyncGenerator
 from dataclasses import dataclass
-from nanochat.common import compute_init, autodetect_device_type
+from nanochat.common import NANOCHAT_KV_CACHE_TYPE, compute_init, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
 from nanochat.engine import Engine
 
@@ -70,6 +70,7 @@ parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
 parser.add_argument('-p', '--port', type=int, default=8000, help='Port to run the server on')
 parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
 parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to bind the server to')
+parser.add_argument('--kv-cache-type', type=str, default=NANOCHAT_KV_CACHE_TYPE, choices=['fp16', 'turbo3', 'turbo35', 'turbo25'], help='KV cache implementation: fp16|turbo3|turbo35|turbo25')
 args = parser.parse_args()
 
 # Configure logging for conversation traffic
@@ -120,7 +121,7 @@ class WorkerPool:
                 print(f"Loading model on {device_type}...")
 
             model, tokenizer, _ = load_model(source, device, phase="eval", model_tag=model_tag, step=step)
-            engine = Engine(model, tokenizer)
+            engine = Engine(model, tokenizer, kv_cache_type=args.kv_cache_type)
             worker = Worker(
                 gpu_id=gpu_id,
                 device=device,

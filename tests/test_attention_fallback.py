@@ -17,7 +17,7 @@ import torch
 import pytest
 import nanochat.flash_attention as fa_module
 from nanochat.flash_attention import flash_attn, HAS_FA3
-from nanochat.engine import KVCache
+from nanochat.engine import KVCache, TurboQuantKVCache
 
 
 def set_impl(impl):
@@ -331,6 +331,66 @@ class TestSDPAOnly:
 
         assert y_single.shape == (B, 1, H, D)
         assert cache.get_pos() == T_prefill + 1
+        set_impl(None)
+
+    def test_turboquant_kvcache(self):
+        """Test TurboQuant cache path reconstructs slices correctly inside the wrapper."""
+        set_impl('sdpa')
+        B, T_max, H, D = 1, 48, 2, 64
+        cache = TurboQuantKVCache(
+            batch_size=B,
+            num_heads=H,
+            seq_len=T_max,
+            head_dim=D,
+            num_layers=1,
+            device=self.DEVICE,
+            dtype=self.DTYPE,
+            kv_cache_type="turbo3",
+        )
+
+        T_prefill = 12
+        q = torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        k = torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        v = torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE)
+
+        y = flash_attn.flash_attn_with_kvcache(
+            q,
+            k=k,
+            v=v,
+            cache_seqlens=cache.cache_seqlens,
+            causal=True,
+            window_size=(T_max, 0),
+            kv_cache=cache,
+            layer_idx=0,
+        )
+        cache.advance(T_prefill)
+        k_full, v_full = cache.get_dequantized_slice(0, 0, T_prefill, dtype=self.DTYPE)
+        y_expected = flash_attn.flash_attn_func(q, k_full, v_full, causal=True, window_size=(T_max, 0))
+        assert_close(y, y_expected, "turboquant_prefill", atol=1e-4, rtol=1e-4)
+
+        q_single = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        k_single = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        v_single = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        y_single = flash_attn.flash_attn_with_kvcache(
+            q_single,
+            k=k_single,
+            v=v_single,
+            cache_seqlens=cache.cache_seqlens,
+            causal=True,
+            window_size=(T_max, 0),
+            kv_cache=cache,
+            layer_idx=0,
+        )
+        cache.advance(1)
+        k_full, v_full = cache.get_dequantized_slice(0, 0, T_prefill + 1, dtype=self.DTYPE)
+        y_expected_single = flash_attn.flash_attn_func(
+            q_single,
+            k_full,
+            v_full,
+            causal=True,
+            window_size=(T_max, 0),
+        )
+        assert_close(y_single, y_expected_single, "turboquant_decode", atol=1e-4, rtol=1e-4)
         set_impl(None)
 
 

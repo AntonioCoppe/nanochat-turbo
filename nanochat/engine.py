@@ -11,14 +11,25 @@ Notes:
 The whole thing is made as efficient as possible.
 """
 
-import torch
-import torch.nn.functional as F
 import signal
 import warnings
-from contextlib import contextmanager
+import math
+import os
 from collections import deque
-from nanochat.common import compute_init, autodetect_device_type
-from nanochat.checkpoint_manager import load_model
+from contextlib import contextmanager
+from dataclasses import dataclass
+
+import torch
+import torch.nn.functional as F
+from filelock import FileLock
+from scipy import integrate
+
+from nanochat.common import (
+    NANOCHAT_KV_CACHE_TYPE,
+    autodetect_device_type,
+    compute_init,
+    get_base_dir,
+)
 
 # -----------------------------------------------------------------------------
 # Calculator tool helpers
@@ -79,6 +90,205 @@ def use_calculator(expr):
     return eval_with_timeout(expr)
 
 # -----------------------------------------------------------------------------
+_TURBOQUANT_EPS = 1e-8
+_TURBOQUANT_QJL_SCALE = math.sqrt(math.pi / 2.0)
+_TURBOQUANT_CODEBOOK_CACHE = {}
+
+
+def _is_power_of_two(n):
+    return n > 0 and (n & (n - 1)) == 0
+
+
+def _fwht(x):
+    """Fast Walsh-Hadamard transform over the last dimension."""
+    h = 1
+    y = x
+    while h < y.size(-1):
+        y = y.reshape(*y.shape[:-1], -1, 2 * h)
+        left = y[..., :h]
+        right = y[..., h:]
+        y = torch.cat((left + right, left - right), dim=-1)
+        y = y.reshape(*x.shape[:-1], -1)
+        h *= 2
+    return y
+
+
+def _random_signs(dim, seed, device):
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    signs = torch.randint(0, 2, (dim,), generator=generator, dtype=torch.int8)
+    signs = signs.float().mul_(2.0).sub_(1.0)
+    return signs.to(device=device)
+
+
+def _qr_rotation_matrix(dim, seed, device):
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    gaussian = torch.randn(dim, dim, generator=generator, dtype=torch.float32)
+    q, r = torch.linalg.qr(gaussian)
+    diag_sign = torch.sign(torch.diag(r))
+    diag_sign[diag_sign == 0] = 1.0
+    rotation = q * diag_sign.unsqueeze(0)
+    return rotation.to(device=device)
+
+
+def _qjl_projection_matrix(dim, seed, device):
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    return torch.randn(dim, dim, generator=generator, dtype=torch.float32, device=device)
+
+
+def _beta_coordinate_pdf(x, dim):
+    if x <= -1.0 or x >= 1.0:
+        return 0.0
+    log_coeff = math.lgamma(dim / 2.0) - 0.5 * math.log(math.pi) - math.lgamma((dim - 1.0) / 2.0)
+    return math.exp(log_coeff + ((dim - 3.0) / 2.0) * math.log1p(-(x * x)))
+
+
+def _solve_beta_lloyd_max(dim, bits, max_iter=200, tol=1e-10):
+    """Solve the exact Beta-distribution Lloyd-Max codebook from TurboQuant."""
+    n_levels = 1 << bits
+    centroids = [(-1.0 + (2.0 * (i + 0.5) / n_levels)) for i in range(n_levels)]
+    for _ in range(max_iter):
+        boundaries = [(centroids[i] + centroids[i + 1]) / 2.0 for i in range(n_levels - 1)]
+        edges = [-1.0] + boundaries + [1.0]
+        new_centroids = []
+        for i in range(n_levels):
+            left, right = edges[i], edges[i + 1]
+            numerator = integrate.quad(
+                lambda x: x * _beta_coordinate_pdf(x, dim),
+                left,
+                right,
+                limit=200,
+            )[0]
+            denominator = integrate.quad(
+                lambda x: _beta_coordinate_pdf(x, dim),
+                left,
+                right,
+                limit=200,
+            )[0]
+            new_centroids.append(numerator / denominator if denominator > 1e-15 else centroids[i])
+        max_shift = max(abs(a - b) for a, b in zip(new_centroids, centroids))
+        centroids = new_centroids
+        if max_shift < tol:
+            break
+    boundaries = [(centroids[i] + centroids[i + 1]) / 2.0 for i in range(n_levels - 1)]
+    return (
+        torch.tensor(centroids, dtype=torch.float32),
+        torch.tensor(boundaries, dtype=torch.float32),
+    )
+
+
+def _get_codebook_cache_dir():
+    cache_dir = f"{get_base_dir()}/turboquant/codebooks"
+    os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir
+
+
+def _load_turboquant_codebook(dim, bits, device):
+    key = (dim, bits)
+    if key not in _TURBOQUANT_CODEBOOK_CACHE:
+        cache_dir = _get_codebook_cache_dir()
+        lock_path = f"{cache_dir}/beta_d{dim}_b{bits}.lock"
+        data_path = f"{cache_dir}/beta_d{dim}_b{bits}.pt"
+        with FileLock(lock_path):
+            if not os.path.exists(data_path):
+                centroids, boundaries = _solve_beta_lloyd_max(dim, bits)
+                torch.save({"centroids": centroids, "boundaries": boundaries}, data_path)
+            payload = torch.load(data_path, map_location="cpu")
+        _TURBOQUANT_CODEBOOK_CACHE[key] = (
+            payload["centroids"].contiguous(),
+            payload["boundaries"].contiguous(),
+        )
+    centroids, boundaries = _TURBOQUANT_CODEBOOK_CACHE[key]
+    return centroids.to(device=device), boundaries.to(device=device)
+
+
+def _pack_bits(values, bits):
+    if bits <= 0:
+        raise ValueError("bits must be positive")
+    shape = values.shape
+    flat = values.reshape(-1, shape[-1]).to(dtype=torch.int32)
+    total_bits = shape[-1] * bits
+    packed_bytes = (total_bits + 7) // 8
+    packed = torch.zeros(flat.size(0), packed_bytes, dtype=torch.int32, device=values.device)
+    mask = (1 << bits) - 1
+    for idx in range(shape[-1]):
+        bit_offset = idx * bits
+        byte_idx = bit_offset // 8
+        intra = bit_offset % 8
+        value = flat[:, idx] & mask
+        packed[:, byte_idx] |= (value << intra) & 0xFF
+        spill_bits = intra + bits - 8
+        if spill_bits > 0:
+            packed[:, byte_idx + 1] |= value >> (bits - spill_bits)
+    return packed.to(torch.uint8).reshape(*shape[:-1], packed_bytes)
+
+
+def _unpack_bits(packed, num_values, bits):
+    if bits <= 0:
+        raise ValueError("bits must be positive")
+    shape = packed.shape
+    flat = packed.reshape(-1, shape[-1]).to(dtype=torch.int32)
+    values = torch.zeros(flat.size(0), num_values, dtype=torch.int32, device=packed.device)
+    mask = (1 << bits) - 1
+    for idx in range(num_values):
+        bit_offset = idx * bits
+        byte_idx = bit_offset // 8
+        intra = bit_offset % 8
+        value = flat[:, byte_idx] >> intra
+        spill_bits = intra + bits - 8
+        if spill_bits > 0:
+            value |= flat[:, byte_idx + 1] << (bits - spill_bits)
+        values[:, idx] = value & mask
+    return values.to(torch.uint8).reshape(*shape[:-1], num_values)
+
+
+@dataclass(frozen=True)
+class TurboQuantGroup:
+    start: int
+    end: int
+    total_bits: int
+    key_mse_bits: int
+    value_bits: int
+    key_packed_bytes: int
+    value_packed_bytes: int
+
+    @property
+    def size(self):
+        return self.end - self.start
+
+
+def _build_turboquant_groups(head_dim, kv_cache_type):
+    if kv_cache_type == "turbo3":
+        layout = [(0, head_dim, 3)]
+    elif kv_cache_type == "turbo25":
+        split = math.ceil(0.25 * head_dim)
+        layout = [(0, split, 3), (split, head_dim, 2)]
+    elif kv_cache_type == "turbo35":
+        split = math.ceil(0.5 * head_dim)
+        layout = [(0, split, 4), (split, head_dim, 3)]
+    else:
+        raise ValueError(f"Unsupported TurboQuant mode: {kv_cache_type}")
+    groups = []
+    for start, end, total_bits in layout:
+        if end <= start:
+            continue
+        size = end - start
+        key_mse_bits = max(total_bits - 1, 1)
+        value_bits = total_bits
+        groups.append(TurboQuantGroup(
+            start=start,
+            end=end,
+            total_bits=total_bits,
+            key_mse_bits=key_mse_bits,
+            value_bits=value_bits,
+            key_packed_bytes=(size * key_mse_bits + 7) // 8,
+            value_packed_bytes=(size * value_bits + 7) // 8,
+        ))
+    return groups
+
+
 class KVCache:
     """
     KV Cache designed for Flash Attention 3's flash_attn_with_kvcache API.
@@ -90,11 +300,15 @@ class KVCache:
     """
 
     def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers, device, dtype):
+        self.is_turbo = False
+        self.kv_cache_type = "fp16"
         self.batch_size = batch_size
         self.max_seq_len = seq_len
         self.n_layers = num_layers
         self.n_heads = num_heads
         self.head_dim = head_dim
+        self.device = torch.device(device)
+        self.dtype = dtype
         # Pre-allocate cache tensors: (n_layers, B, T, H, D)
         self.k_cache = torch.zeros(num_layers, batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
         self.v_cache = torch.zeros(num_layers, batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
@@ -136,6 +350,258 @@ class KVCache:
         if other.prev_embedding is not None:
             self.prev_embedding = other.prev_embedding.expand(self.batch_size, -1, -1).clone()
 
+
+class TurboQuantKVCache:
+    """
+    KV cache that stores TurboQuant-compressed keys and values.
+
+    This follows TurboQuant (Zandieh et al., 2025): exact Beta Lloyd-Max codebooks,
+    random orthogonal rotations, and a 1-bit QJL correction for keys.
+    """
+
+    def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers, device, dtype, kv_cache_type):
+        if kv_cache_type not in {"turbo3", "turbo25", "turbo35"}:
+            raise ValueError(f"Unsupported TurboQuant mode: {kv_cache_type}")
+        self.is_turbo = True
+        self.kv_cache_type = kv_cache_type
+        self.batch_size = batch_size
+        self.max_seq_len = seq_len
+        self.n_layers = num_layers
+        self.n_heads = num_heads
+        self.head_dim = head_dim
+        self.device = torch.device(device)
+        self.dtype = dtype
+        self.groups = _build_turboquant_groups(head_dim, kv_cache_type)
+        self.rotation_impl = "fwht" if _is_power_of_two(head_dim) else "qr"
+        self.cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
+        self.prev_embedding = None
+        self.qjl_scale = _TURBOQUANT_QJL_SCALE / head_dim
+
+        self.group_codebooks = []
+        for group in self.groups:
+            key_centroids, key_boundaries = _load_turboquant_codebook(head_dim, group.key_mse_bits, self.device)
+            value_centroids, value_boundaries = _load_turboquant_codebook(head_dim, group.value_bits, self.device)
+            self.group_codebooks.append({
+                "key_centroids": key_centroids,
+                "key_boundaries": key_boundaries,
+                "value_centroids": value_centroids,
+                "value_boundaries": value_boundaries,
+            })
+
+        if self.rotation_impl == "fwht":
+            self.k_signs = torch.stack(
+                [_random_signs(head_dim, 17_003 + layer_idx, self.device) for layer_idx in range(num_layers)],
+                dim=0,
+            )
+            self.v_signs = torch.stack(
+                [_random_signs(head_dim, 29_011 + layer_idx, self.device) for layer_idx in range(num_layers)],
+                dim=0,
+            )
+            self.k_rotations = None
+            self.v_rotations = None
+        else:
+            # TODO: experiment with padded FWHT for non-power-of-two head dims in a future fused path.
+            self.k_signs = None
+            self.v_signs = None
+            self.k_rotations = torch.stack(
+                [_qr_rotation_matrix(head_dim, 17_003 + layer_idx, self.device) for layer_idx in range(num_layers)],
+                dim=0,
+            )
+            self.v_rotations = torch.stack(
+                [_qr_rotation_matrix(head_dim, 29_011 + layer_idx, self.device) for layer_idx in range(num_layers)],
+                dim=0,
+            )
+        self.k_qjl = torch.stack(
+            [_qjl_projection_matrix(head_dim, 41_021 + layer_idx, self.device) for layer_idx in range(num_layers)],
+            dim=0,
+        )
+
+        self.k_code_cache = [
+            torch.zeros(
+                num_layers, batch_size, seq_len, num_heads, group.key_packed_bytes,
+                device=device, dtype=torch.uint8,
+            )
+            for group in self.groups
+        ]
+        self.v_code_cache = [
+            torch.zeros(
+                num_layers, batch_size, seq_len, num_heads, group.value_packed_bytes,
+                device=device, dtype=torch.uint8,
+            )
+            for group in self.groups
+        ]
+        self.k_qjl_signs = torch.zeros(
+            num_layers, batch_size, seq_len, num_heads, (head_dim + 7) // 8,
+            device=device, dtype=torch.uint8,
+        )
+        self.k_vec_norms = torch.zeros(num_layers, batch_size, seq_len, num_heads, device=device, dtype=torch.float16)
+        self.k_residual_norms = torch.zeros(num_layers, batch_size, seq_len, num_heads, device=device, dtype=torch.float16)
+        self.v_vec_norms = torch.zeros(num_layers, batch_size, seq_len, num_heads, device=device, dtype=torch.float16)
+
+    def reset(self):
+        self.cache_seqlens.zero_()
+        self.prev_embedding = None
+
+    def get_pos(self):
+        return self.cache_seqlens[0].item()
+
+    def get_layer_cache(self, layer_idx):
+        raise RuntimeError("TurboQuantKVCache does not expose raw FA3 cache tensors")
+
+    def advance(self, num_tokens):
+        self.cache_seqlens += num_tokens
+
+    def _rotate(self, x, layer_idx, kind):
+        if self.rotation_impl == "fwht":
+            signs = self.k_signs[layer_idx] if kind == "k" else self.v_signs[layer_idx]
+            return _fwht(x * signs) / math.sqrt(self.head_dim)
+        rotation = self.k_rotations[layer_idx] if kind == "k" else self.v_rotations[layer_idx]
+        return torch.matmul(x, rotation.t())
+
+    def _inverse_rotate(self, x, layer_idx, kind):
+        if self.rotation_impl == "fwht":
+            signs = self.k_signs[layer_idx] if kind == "k" else self.v_signs[layer_idx]
+            return (_fwht(x) / math.sqrt(self.head_dim)) * signs
+        rotation = self.k_rotations[layer_idx] if kind == "k" else self.v_rotations[layer_idx]
+        return torch.matmul(x, rotation)
+
+    def quantize_and_store(self, layer_idx, k, v, start_pos):
+        """
+        TurboQuant paper (Zandieh et al., 2025): normalize, rotate, Lloyd-Max quantize,
+        and store a 1-bit QJL correction for keys before caching.
+        """
+        end_pos = start_pos + k.size(1)
+        k = k.float()
+        v = v.float()
+        k_norms = torch.linalg.vector_norm(k, dim=-1, keepdim=True).clamp_min(_TURBOQUANT_EPS)
+        v_norms = torch.linalg.vector_norm(v, dim=-1, keepdim=True).clamp_min(_TURBOQUANT_EPS)
+        k_unit = k / k_norms
+        v_unit = v / v_norms
+        k_rot = self._rotate(k_unit, layer_idx, "k")
+        v_rot = self._rotate(v_unit, layer_idx, "v")
+        k_mse_rot = torch.zeros_like(k_rot)
+        v_mse_rot = torch.zeros_like(v_rot)
+
+        for group_idx, group in enumerate(self.groups):
+            codebook = self.group_codebooks[group_idx]
+            k_group = k_rot[..., group.start:group.end].contiguous()
+            k_indices = torch.bucketize(k_group, codebook["key_boundaries"])
+            self.k_code_cache[group_idx][layer_idx, :, start_pos:end_pos] = _pack_bits(k_indices, group.key_mse_bits)
+            k_mse_rot[..., group.start:group.end] = codebook["key_centroids"][k_indices.long()]
+
+            v_group = v_rot[..., group.start:group.end].contiguous()
+            v_indices = torch.bucketize(v_group, codebook["value_boundaries"])
+            self.v_code_cache[group_idx][layer_idx, :, start_pos:end_pos] = _pack_bits(v_indices, group.value_bits)
+            v_mse_rot[..., group.start:group.end] = codebook["value_centroids"][v_indices.long()]
+
+        k_mse = self._inverse_rotate(k_mse_rot, layer_idx, "k")
+        residual = k_unit - k_mse
+        residual_norm = torch.linalg.vector_norm(residual, dim=-1)
+        projected = torch.matmul(residual, self.k_qjl[layer_idx].t())
+        sign_bits = (projected >= 0).to(torch.uint8)
+
+        self.k_qjl_signs[layer_idx, :, start_pos:end_pos] = _pack_bits(sign_bits, 1)
+        self.k_vec_norms[layer_idx, :, start_pos:end_pos] = k_norms.squeeze(-1).to(torch.float16)
+        self.k_residual_norms[layer_idx, :, start_pos:end_pos] = residual_norm.to(torch.float16)
+        self.v_vec_norms[layer_idx, :, start_pos:end_pos] = v_norms.squeeze(-1).to(torch.float16)
+
+    def get_dequantized_slice(self, layer_idx, start, end, dtype=None):
+        """
+        TurboQuant paper (Zandieh et al., 2025): reconstruct the active slice by
+        inverse-rotating MSE centroids and adding the QJL residual correction for keys.
+        """
+        target_dtype = self.dtype if dtype is None else dtype
+        seq_len = end - start
+        k_rot = torch.zeros(self.batch_size, seq_len, self.n_heads, self.head_dim, device=self.device, dtype=torch.float32)
+        v_rot = torch.zeros_like(k_rot)
+
+        for group_idx, group in enumerate(self.groups):
+            codebook = self.group_codebooks[group_idx]
+            k_indices = _unpack_bits(
+                self.k_code_cache[group_idx][layer_idx, :, start:end],
+                group.size,
+                group.key_mse_bits,
+            )
+            v_indices = _unpack_bits(
+                self.v_code_cache[group_idx][layer_idx, :, start:end],
+                group.size,
+                group.value_bits,
+            )
+            k_rot[..., group.start:group.end] = codebook["key_centroids"][k_indices.long()]
+            v_rot[..., group.start:group.end] = codebook["value_centroids"][v_indices.long()]
+
+        k_mse = self._inverse_rotate(k_rot, layer_idx, "k")
+        qjl_sign_bits = _unpack_bits(self.k_qjl_signs[layer_idx, :, start:end], self.head_dim, 1)
+        qjl_signs = qjl_sign_bits.float().mul_(2.0).sub_(1.0)
+        qjl = self.qjl_scale * self.k_residual_norms[layer_idx, :, start:end].float().unsqueeze(-1)
+        qjl = qjl * torch.matmul(qjl_signs, self.k_qjl[layer_idx])
+        k = (k_mse + qjl) * self.k_vec_norms[layer_idx, :, start:end].float().unsqueeze(-1)
+
+        v_mse = self._inverse_rotate(v_rot, layer_idx, "v")
+        v = v_mse * self.v_vec_norms[layer_idx, :, start:end].float().unsqueeze(-1)
+        return k.to(dtype=target_dtype), v.to(dtype=target_dtype)
+
+    def compression_stats(self):
+        active_tokens = self.get_pos()
+        active_vectors = self.n_layers * self.batch_size * active_tokens * self.n_heads
+        key_bits = active_vectors * sum(group.key_packed_bytes * 8 for group in self.groups)
+        value_bits = active_vectors * sum(group.value_packed_bytes * 8 for group in self.groups)
+        qjl_bits = active_vectors * (((self.head_dim + 7) // 8) * 8)
+        norm_bits = active_vectors * 3 * 16
+        compressed_bits = key_bits + value_bits + qjl_bits + norm_bits
+        fp16_bits = active_vectors * self.head_dim * 16 * 2
+        return {
+            "active_tokens": active_tokens,
+            "compressed_bits": compressed_bits,
+            "fp16_bits": fp16_bits,
+            "compression_ratio": fp16_bits / max(compressed_bits, 1),
+        }
+
+    def prefill(self, other):
+        assert self.get_pos() == 0, "Cannot prefill a non-empty KV cache"
+        assert isinstance(other, TurboQuantKVCache), "TurboQuant prefill expects another TurboQuant cache"
+        assert self.kv_cache_type == other.kv_cache_type
+        assert self.n_layers == other.n_layers and self.n_heads == other.n_heads and self.head_dim == other.head_dim
+        assert self.max_seq_len >= other.max_seq_len
+        other_pos = other.get_pos()
+        for group_idx in range(len(self.groups)):
+            source_k = other.k_code_cache[group_idx][:, :, :other_pos]
+            source_v = other.v_code_cache[group_idx][:, :, :other_pos]
+            self.k_code_cache[group_idx][:, :, :other_pos] = source_k.expand(-1, self.batch_size, -1, -1, -1)
+            self.v_code_cache[group_idx][:, :, :other_pos] = source_v.expand(-1, self.batch_size, -1, -1, -1)
+        self.k_qjl_signs[:, :, :other_pos] = other.k_qjl_signs[:, :, :other_pos].expand(-1, self.batch_size, -1, -1, -1)
+        self.k_vec_norms[:, :, :other_pos] = other.k_vec_norms[:, :, :other_pos].expand(-1, self.batch_size, -1, -1)
+        self.k_residual_norms[:, :, :other_pos] = other.k_residual_norms[:, :, :other_pos].expand(-1, self.batch_size, -1, -1)
+        self.v_vec_norms[:, :, :other_pos] = other.v_vec_norms[:, :, :other_pos].expand(-1, self.batch_size, -1, -1)
+        self.cache_seqlens.fill_(other_pos)
+        if other.prev_embedding is not None:
+            self.prev_embedding = other.prev_embedding.expand(self.batch_size, -1, -1).clone()
+
+
+def _create_kv_cache(*, kv_cache_type, batch_size, num_heads, seq_len, head_dim, num_layers, device, dtype):
+    if kv_cache_type == "fp16":
+        return KVCache(
+            batch_size=batch_size,
+            num_heads=num_heads,
+            seq_len=seq_len,
+            head_dim=head_dim,
+            num_layers=num_layers,
+            device=device,
+            dtype=dtype,
+        )
+    if kv_cache_type in {"turbo3", "turbo25", "turbo35"}:
+        return TurboQuantKVCache(
+            batch_size=batch_size,
+            num_heads=num_heads,
+            seq_len=seq_len,
+            head_dim=head_dim,
+            num_layers=num_layers,
+            device=device,
+            dtype=dtype,
+            kv_cache_type=kv_cache_type,
+        )
+    raise ValueError(f"Unsupported kv_cache_type: {kv_cache_type}")
+
 # -----------------------------------------------------------------------------
 @torch.inference_mode()
 def sample_next_token(logits, rng, temperature=1.0, top_k=None):
@@ -168,9 +634,10 @@ class RowState:
 
 class Engine:
 
-    def __init__(self, model, tokenizer):
+    def __init__(self, model, tokenizer, kv_cache_type=NANOCHAT_KV_CACHE_TYPE):
         self.model = model
         self.tokenizer = tokenizer # needed for tool use
+        self.kv_cache_type = kv_cache_type
 
     @torch.inference_mode()
     def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
@@ -199,7 +666,8 @@ class Engine:
         # 1) Run a batch 1 prefill of the prompt tokens
         m = self.model.config
         kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
-        kv_cache_prefill = KVCache(
+        kv_cache_prefill = _create_kv_cache(
+            kv_cache_type=self.kv_cache_type,
             batch_size=1,
             seq_len=len(tokens),
             device=device,
@@ -212,7 +680,8 @@ class Engine:
 
         # 2) Replicate the KV cache for each sample/row
         kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
-        kv_cache_decode = KVCache(
+        kv_cache_decode = _create_kv_cache(
+            kv_cache_type=self.kv_cache_type,
             batch_size=num_samples,
             seq_len=kv_length_hint,
             device=device,
@@ -310,6 +779,7 @@ if __name__ == "__main__":
     is equivalent to the faster Engine.generate function here.
     """
     import time
+    from nanochat.checkpoint_manager import load_model
     # init compute
     device_type = autodetect_device_type()
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)

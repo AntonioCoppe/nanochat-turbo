@@ -6,7 +6,7 @@ python -m scripts.chat_cli
 """
 import argparse
 import torch
-from nanochat.common import compute_init, autodetect_device_type
+from nanochat.common import NANOCHAT_KV_CACHE_TYPE, compute_init, autodetect_device_type
 from nanochat.engine import Engine
 from nanochat.checkpoint_manager import load_model
 
@@ -18,6 +18,7 @@ parser.add_argument('-p', '--prompt', type=str, default='', help='Prompt the mod
 parser.add_argument('-t', '--temperature', type=float, default=0.6, help='Temperature for generation')
 parser.add_argument('-k', '--top-k', type=int, default=50, help='Top-k sampling parameter')
 parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
+parser.add_argument('--kv-cache-type', type=str, default=NANOCHAT_KV_CACHE_TYPE, choices=['fp16', 'turbo3', 'turbo35', 'turbo25'], help='KV cache implementation: fp16|turbo3|turbo35|turbo25')
 args = parser.parse_args()
 
 # Init the model and tokenizer
@@ -32,7 +33,7 @@ user_start, user_end = tokenizer.encode_special("<|user_start|>"), tokenizer.enc
 assistant_start, assistant_end = tokenizer.encode_special("<|assistant_start|>"), tokenizer.encode_special("<|assistant_end|>")
 
 # Create Engine for efficient generation
-engine = Engine(model, tokenizer)
+engine = Engine(model, tokenizer, kv_cache_type=args.kv_cache_type)
 
 print("\nNanoChat Interactive Mode")
 print("-" * 50)

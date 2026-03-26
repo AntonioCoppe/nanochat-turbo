@@ -87,9 +87,12 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_eval -- -i sft
 
 # chat with the model over CLI! Leave out the -p to chat interactively
 # python -m scripts.chat_cli -p "Why is the sky blue?"
+# Try --kv-cache-type turbo3 for a much smaller KV cache on long prompts
+# python -m scripts.chat_cli -p "Why is the sky blue?" --kv-cache-type turbo3
 
 # even better, chat with your model over a pretty WebUI ChatGPT style
 # python -m scripts.chat_web
+# python -m scripts.chat_web --kv-cache-type turbo3
 
 # -----------------------------------------------------------------------------
 # Generate the full report by putting together all the sections

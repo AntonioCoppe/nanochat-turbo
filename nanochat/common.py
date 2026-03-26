@@ -29,6 +29,7 @@ def _detect_compute_dtype():
         return torch.float32, f"auto-detected: CUDA SM {capability[0]}{capability[1]} (pre-Ampere, bf16 not supported, using fp32)"
     return torch.float32, "auto-detected: no CUDA (CPU/MPS)"
 COMPUTE_DTYPE, COMPUTE_DTYPE_REASON = _detect_compute_dtype()
+NANOCHAT_KV_CACHE_TYPE = os.getenv("NANOCHAT_KV_CACHE_TYPE", "fp16")
 
 class ColoredFormatter(logging.Formatter):
     """Custom formatter that adds colors to log messages."""

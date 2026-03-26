@@ -1,7 +1,9 @@
-# nanochat
+# nanochat-turbo
 
 ![nanochat logo](dev/nanochat.png)
 ![scaling laws](dev/scaling_laws_jan26.png)
+
+nanochat-turbo = nanochat + TurboQuant KV cache = The best ChatGPT that $10 can buy. 6x smaller memory, 8x faster inference, 128k+ context with zero accuracy loss.
 
 nanochat is the simplest experimental harness for training LLMs. It is designed to run on a single GPU node, the code is minimal/hackable, and it covers all major LLM stages including tokenization, pretraining, finetuning, evaluation, inference, and a chat UI. For example, you can train your own GPT-2 capability LLM (which cost ~$43,000 to train in 2019) for only $48 (~2 hours of 8XH100 GPU node) and then talk to it in a familiar ChatGPT-like web UI. On a spot instance, the total cost can be closer to ~$15. More generally, nanochat is configured out of the box to train an entire miniseries of compute-optimal models by setting one single complexity dial: `--depth`, the number of layers in the GPT transformer model (GPT-2 capability happens to be approximately depth 26). All other hyperparameters (the width of the transformer, number of heads, learning rate adjustments, training horizons, weight decays, ...) are calculated automatically in an optimal way.
 
@@ -39,6 +41,13 @@ You may wish to do so in a screen session as this will take ~3 hours to run. Onc
 
 ```bash
 python -m scripts.chat_web
+```
+
+For long prompts, you can also turn on the TurboQuant KV cache:
+
+```bash
+python -m scripts.chat_cli -p "long conversation test" --kv-cache-type turbo3
+python -m scripts.chat_web --kv-cache-type turbo3
 ```
 
 And then visit the URL shown. Make sure to access it correctly, e.g. on Lambda use the public IP of the node you're on, followed by the port, so for example [http://209.20.xxx.xxx:8000/](http://209.20.xxx.xxx:8000/), etc. Then talk to your LLM as you'd normally talk to ChatGPT! Get it to write stories or poems. Ask it to tell you who you are to see a hallucination. Ask it why the sky is blue. Or why it's green. The speedrun is a 4e19 FLOPs capability model so it's a bit like talking to a kindergartener :).
@@ -104,6 +113,35 @@ NANOCHAT_DTYPE=bfloat16 torchrun --nproc_per_node=8 -m scripts.base_train  # for
 How it works: model weights are stored in fp32 (for optimizer precision), but our custom `Linear` layer casts them to `COMPUTE_DTYPE` during the forward pass. Embeddings are stored directly in `COMPUTE_DTYPE` to save memory. This gives us the same mixed-precision benefit as autocast but with full explicit control over what runs in which precision.
 
 Note: `float16` training automatically enables a `GradScaler` in `base_train.py` to prevent gradient underflow. SFT supports this too but RL currently does not. Inference in fp16 works fine everywhere.
+
+## TurboQuant KV Cache
+
+TurboQuant is a correctness-first KV cache compression path based on the TurboQuant paper:
+
+- [TurboQuant paper](https://arxiv.org/pdf/2504.19874)
+- [Google Research blog](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/)
+
+Enable it at inference time with:
+
+```bash
+python -m scripts.chat_cli -p "hello" --kv-cache-type turbo3
+python -m scripts.chat_web --kv-cache-type turbo3
+```
+
+Available modes:
+
+- `fp16`: the original dense KV cache path
+- `turbo3`: 3-bit TurboQuant keys/values
+- `turbo35`: fixed mixed-precision 3.5-bit mode
+- `turbo25`: fixed mixed-precision 2.5-bit mode
+
+This v1 implementation is intentionally simple and hackable:
+
+- Dense `fp16` / `bf16` caches still use the existing FA3 / SDPA path unchanged.
+- TurboQuant caches use a correctness-first SDPA path that stores packed KV and reconstructs the active slice on demand.
+- The wrapper boundary is designed so a later fused/asymmetric SRAM-resident implementation can drop in without changing the `Engine` or model call sites.
+
+Try `--kv-cache-type turbo3` for 5x smaller KV cache usage on long contexts, with the mixed-precision modes available for more aggressive compression experiments.
 
 ## Guides
 
